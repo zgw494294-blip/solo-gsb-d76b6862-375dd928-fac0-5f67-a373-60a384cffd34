@@ -13,6 +13,10 @@ const state = {
   splitRefsTo: "front", // 原指向被拆条款的引用落到 front（前段）还是 back（后段）
   idCounter: 0, // 本草稿已用过的最大身份号：拆分新段取 idCounter+1，删除/合并移除的身份不复用
   preview: null, // 服务端 /api/preview 返回；仅当 previewFresh 为真时与当前草稿对应
+  previewError: null, // 最近一次预览失败的错误信息（数组）；成功一次或重新导入后清空
+  renderedRev: null, // 页面当前 DOM 所呈现草稿的修订号；预览失败时据此判断列表是否停留在旧编号
+  renderedSplittingId: null, // 当前 DOM 渲染时正在打开拆分选择器的条款（null 表示没有）
+  renderedEditingId: null, // 当前 DOM 渲染时正在编辑的条款（null 表示没有）
   dragId: null,
   epoch: 0, // 草稿世代：导入成功 / 重新导入时 +1；上一草稿的迟到响应一律丢弃
   rev: 0, // 草稿修订号：任何本地改动 +1；响应发出后草稿又有改动的，响应不再适用
@@ -28,6 +32,7 @@ const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超
 
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
+let previewInFlight = false; // 是否已有 /api/preview 在途：防止重试预览重复提交
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -41,6 +46,7 @@ const importBtn = $("#import-btn");
 const clauseList = $("#clause-list");
 const previewText = $("#preview-text");
 const brokenBanner = $("#broken-banner");
+const previewErrorBanner = $("#preview-error-banner");
 const downloadBtn = $("#download-btn");
 const mergeBtn = $("#merge-btn");
 const statCount = $("#stat-count");
@@ -73,6 +79,16 @@ async function api(path, body) {
   return data;
 }
 
+// 把任何失败（服务端 4xx/5xx、JSON 解析失败、断网等 TypeError）归一成可展示的字符串数组。
+// 网络异常时 e.errors 可能不存在，直接 .join() 会再抛异常导致失败信息显示不出来。
+function errorList(e) {
+  const raw = e && e.errors;
+  if (Array.isArray(raw) && raw.length) return raw.map((m) => String(m));
+  if (typeof raw === "string" && raw) return [raw];
+  const message = e && typeof e.message === "string" && e.message ? e.message : "";
+  return [message ? `请求失败（${message}），请检查网络后重试。` : "请求失败，请检查网络后重试。"];
+}
+
 function snapshot() {
   return {
     order_ids: state.orderIds,
@@ -94,6 +110,58 @@ function touch() {
 function syncToolbar() {
   updateMergeBtn();
   updateDownloadBtn();
+  syncBusy();
+}
+
+// 列表是否应整体暂停操作（置灰、拦截事件，结束后自动恢复）：
+// - 合并 / 拆分提交在途；
+// - 预览失败且页面停留在旧编号（renderedRev 与当前草稿不一致）；
+// - 预览失败且刚打开的拆分选择器 / 编辑器尚未渲染出来（DOM 里没有对应入口）。
+// 已成功渲染的拆分选择器在预览失败时仍可继续操作（选分界、确认、取消），
+// 其重试入口在失败横幅上。
+function listLocked() {
+  if (state.merging || state.splitting) return true;
+  if (state.previewError === null) return false;
+  if (state.renderedRev !== state.rev) return true;
+  if (state.splittingId !== null && state.renderedSplittingId !== state.splittingId) return true;
+  if (state.editingId !== null && state.renderedEditingId !== state.editingId) return true;
+  return false;
+}
+
+function syncBusy() {
+  clauseList.classList.toggle("busy", listLocked());
+}
+
+// 预览失败横幅：始终可重试预览；拆分选择器或编辑器尚未渲染出来时还提供对应
+// 的取消入口（成功取消后恢复原草稿卡片操作）。拆分选择器已渲染时，其卡片内
+// 的「取消 / 确认拆分」与分界选择照常可用。
+function syncPreviewErrorBanner() {
+  const errors = state.previewError;
+  if (errors === null) {
+    previewErrorBanner.hidden = true;
+    previewErrorBanner.textContent = "";
+    return;
+  }
+  const stale =
+    state.renderedRev !== state.rev ||
+    (state.splittingId !== null && state.renderedSplittingId !== state.splittingId) ||
+    (state.editingId !== null && state.renderedEditingId !== state.editingId);
+  const cancel = state.splittingId
+    ? '<button type="button" data-action="preview-cancel-split">取消拆分</button>'
+    : state.editingId
+      ? '<button type="button" data-action="preview-cancel-edit">取消编辑</button>'
+      : "";
+  const scope = stale
+    ? "草稿改动（可能含刚完成的拆分、合并或保存）已保留，但页面仍停留在旧内容：列表操作、引用跳转与下载已暂停。"
+    : "原草稿未改动，可继续当前拆分选择，或取消后恢复卡片操作。";
+  previewErrorBanner.innerHTML =
+    `<strong>预览刷新失败。</strong>${scope}` +
+    `<ul>${errors.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` +
+    `<div class="preview-error-actions">` +
+    `<button type="button" class="primary" data-action="preview-retry"${
+      previewInFlight ? " disabled" : ""
+    }>${previewInFlight ? "重试中…" : "重试预览"}</button>${cancel}</div>`;
+  previewErrorBanner.hidden = false;
 }
 
 function updateMergeBtn() {
@@ -160,14 +228,19 @@ importBtn.addEventListener("click", async () => {
     state.splitting = false;
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分新身份从 N+1 起
     state.preview = null;
+    state.previewError = null;
+    state.renderedRev = null;
+    state.renderedSplittingId = null;
+    state.renderedEditingId = null;
     state.epoch += 1; // 新草稿世代：上一草稿的在途请求全部作废
+    previewInFlight = false;
     touch();
     importErrors.hidden = true;
     importPanel.hidden = true;
     desk.hidden = false;
     render();
   } catch (e) {
-    importErrors.innerHTML = e.errors.map((m) => `<li>${esc(m)}</li>`).join("");
+    importErrors.innerHTML = errorList(e).map((m) => `<li>${esc(m)}</li>`).join("");
     importErrors.hidden = false;
   } finally {
     state.importing = false;
@@ -190,6 +263,10 @@ $("#reimport-btn").addEventListener("click", () => {
   state.splitRefsTo = "front";
   state.idCounter = 0;
   state.preview = null;
+  state.previewError = null;
+  state.renderedRev = null;
+  state.renderedSplittingId = null;
+  state.renderedEditingId = null;
   state.previewFresh = false;
   state.rev += 1;
   state.saving = false;
@@ -197,9 +274,10 @@ $("#reimport-btn").addEventListener("click", () => {
   state.splitting = false;
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
-  clauseList.classList.remove("busy");
+  previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
   desk.hidden = true;
   importPanel.hidden = false;
+  syncPreviewErrorBanner();
   syncToolbar();
 });
 
@@ -210,20 +288,46 @@ async function render() {
   const epoch = state.epoch;
   const rev = state.rev;
   const seq = ++previewSeq;
+  // 在途标记仅由“当前世代、最后一次”的 render 收尾，迟到响应（已重新导入或
+  // 被更新的预览取代）不得清掉新请求的在途状态，也不得改动新稿提示与按钮。
+  previewInFlight = true;
+  syncPreviewErrorBanner();
+  syncBusy();
+  try {
+    await renderPreview(epoch, rev, seq);
+  } finally {
+    // 已重新导入：旧请求（拆分/合并后的预览等）的响应与收尾一律不得改动
+    // 新稿的列表、提示或按钮；在途标记由重新导入处理直接复位
+    if (epoch !== state.epoch) return;
+    if (seq === previewSeq) previewInFlight = false; // 被更新预览取代时，由最新者收尾
+    syncPreviewErrorBanner();
+    syncBusy();
+  }
+}
+
+async function renderPreview(epoch, rev, seq) {
   let data;
   try {
     data = await api("/api/preview", snapshot());
   } catch (e) {
     if (seq !== previewSeq || epoch !== state.epoch || rev !== state.rev) return; // 迟到响应：丢弃
-    state.previewFresh = false; // 预览未追上草稿：保持禁止下载 / 合并
+    // 预览失败：保留当前草稿与既有 DOM，不回滚任何已完成的改动；
+    // 显示失败信息并重试/取消入口，列表与下载在预览恢复前保持锁定
+    state.previewFresh = false;
+    state.previewError = errorList(e);
     syncToolbar();
-    alert("预览刷新失败：\n" + e.errors.join("\n"));
+    syncPreviewErrorBanner();
+    syncBusy();
     return;
   }
   // 只采用仍适用于当前草稿的响应：之后已发出更新的预览、或草稿已变化 / 已重新导入，则丢弃
   if (seq !== previewSeq || epoch !== state.epoch || rev !== state.rev) return;
   state.preview = data;
   state.previewFresh = true;
+  state.previewError = null;
+  state.renderedRev = rev;
+  state.renderedSplittingId = state.splittingId;
+  state.renderedEditingId = state.editingId;
 
   clauseList.classList.toggle("busy", state.merging || state.splitting);
   clauseList.textContent = "";
@@ -499,7 +603,7 @@ async function submitSplit(id) {
   const epoch = state.epoch;
   // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
   state.splitting = true;
-  clauseList.classList.add("busy");
+  syncBusy();
   setSplitBusy(id, true);
   syncToolbar();
   try {
@@ -527,15 +631,19 @@ async function submitSplit(id) {
     render();
   } catch (e) {
     if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 拆分失败：草稿未改动，恢复被暂时阻止的操作，分界选择保留可修正后重试
+    // 拆分请求失败（含断网等异常）：草稿未改动，分界与引用落点保留供重试或取消；
+    // 用归一化后的错误信息展示，避免异常对象没有 errors 时提示处理再抛异常
     state.splitting = false;
     setSplitBusy(id, false);
     const card = document.getElementById(`card-${id}`);
     if (card) refreshSplitUi(card);
-    showSplitError(id, e.errors);
+    showSplitError(id, errorList(e));
   } finally {
-    clauseList.classList.toggle("busy", state.merging || state.splitting);
-    syncToolbar();
+    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
+    if (epoch === state.epoch) {
+      syncBusy();
+      syncToolbar();
+    }
   }
 }
 
@@ -551,8 +659,8 @@ clauseList.addEventListener("change", (ev) => {
   const pick = ev.target.closest(".merge-pick");
   if (!pick) return;
   const id = pick.closest(".card").dataset.id;
-  if (state.merging || state.splitting) {
-    pick.checked = state.mergeIds.includes(id); // 合并/拆分提交期间不允许改动选择
+  if (state.merging || state.splitting || listLocked()) {
+    pick.checked = state.mergeIds.includes(id); // 合并/拆分提交或预览锁定期间不允许改动选择
     return;
   }
   if (pick.checked) {
@@ -604,7 +712,7 @@ mergeBtn.addEventListener("click", async () => {
   const epoch = state.epoch;
   // 提交期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并，成功或失败后恢复
   state.merging = true;
-  clauseList.classList.add("busy");
+  syncBusy();
   syncToolbar();
   try {
     const data = await api("/api/merge", {
@@ -628,10 +736,12 @@ mergeBtn.addEventListener("click", async () => {
     if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
     // 合并失败：草稿未改动，恢复被暂时阻止的操作（勾选保持不变，可修正后重试）
     state.merging = false;
-    alert("合并失败，草稿未改动：\n" + e.errors.join("\n"));
+    alert("合并失败，草稿未改动：\n" + errorList(e).join("\n"));
   } finally {
-    clauseList.classList.toggle("busy", state.merging);
-    syncToolbar();
+    if (epoch === state.epoch) {
+      syncBusy();
+      syncToolbar();
+    }
   }
 });
 
@@ -641,6 +751,8 @@ mergeBtn.addEventListener("click", async () => {
 clauseList.addEventListener("click", async (ev) => {
   const goto = ev.target.closest("[data-goto]");
   if (goto) {
+    // 预览失败、页面停留在旧编号时禁止用旧编号跳转；合并/拆分提交中也不响应
+    if (listLocked()) return;
     const card = document.getElementById(`card-${goto.dataset.goto}`);
     if (card) {
       card.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -653,7 +765,7 @@ clauseList.addEventListener("click", async (ev) => {
 
   const gap = ev.target.closest("[data-gap]");
   if (gap) {
-    if (state.splitting) return; // 拆分提交期间列表已置灰，这里再兜底
+    if (state.splitting || listLocked()) return; // 拆分提交 / 列表锁定期间列表已置灰，这里再兜底
     const card = gap.closest(".card");
     if (!card || card.dataset.id !== state.splittingId) return;
     state.splitOffset = parseInt(gap.dataset.gap, 10);
@@ -667,10 +779,11 @@ clauseList.addEventListener("click", async (ev) => {
   const id = card.dataset.id;
   const action = btn.dataset.action;
 
-  // 编辑中、拆分选择中或合并/拆分提交中：阻止 编辑 / 删除 / 重排 / 打开拆分（按钮已禁用，这里再兜底）
+  // 编辑中、拆分选择中、合并/拆分提交中或预览失败致列表锁定时：
+  // 阻止 编辑 / 删除 / 重排 / 打开拆分（按钮已禁用，这里再兜底）
   if (
     ["up", "down", "edit", "delete", "split"].includes(action) &&
-    (state.editingId || state.splittingId || state.merging || state.splitting)
+    (state.editingId || state.splittingId || listLocked())
   )
     return;
 
@@ -729,6 +842,26 @@ clauseList.addEventListener("click", async (ev) => {
   }
 });
 
+// 预览失败横幅：重试预览；或在拆分/编辑器尚未渲染出来时取消并恢复原草稿卡片操作
+previewErrorBanner.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-action]");
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === "preview-retry") {
+    if (previewInFlight) return;
+    render();
+  } else if (action === "preview-cancel-split") {
+    // 原草稿保持不变（拆分尚未成功提交），放弃分界选择并恢复卡片操作
+    state.splittingId = null;
+    state.splitOffset = null;
+    state.splitRefsTo = "front";
+    render();
+  } else if (action === "preview-cancel-edit") {
+    state.editingId = null;
+    render();
+  }
+});
+
 function onEditorKey(ev) {
   if (ev.key === "Enter" && !ev.shiftKey) {
     // 只处理单行条款：Enter 不插入换行；Ctrl/⌘+Enter 保存
@@ -763,7 +896,7 @@ async function saveEdit(id) {
       .getElementById(`card-${id}`)
       ?.querySelector('[data-role="edit-errors"]');
     if (errBox) {
-      errBox.innerHTML = e.errors.map((m) => `<li>${esc(m)}</li>`).join("");
+      errBox.innerHTML = errorList(e).map((m) => `<li>${esc(m)}</li>`).join("");
       errBox.hidden = false;
     }
   }
@@ -789,13 +922,13 @@ function attachDnd() {
   for (const card of clauseList.querySelectorAll(".card")) {
     const grip = card.querySelector(".grip");
     grip.addEventListener("mousedown", () => {
-      if (!state.editingId && !state.splittingId && !state.merging && !state.splitting)
+      if (!state.editingId && !state.splittingId && !listLocked())
         card.draggable = true;
     });
     card.addEventListener("mouseup", () => (card.draggable = false));
 
     card.addEventListener("dragstart", (ev) => {
-      if (state.editingId || state.splittingId || state.merging || state.splitting) {
+      if (state.editingId || state.splittingId || listLocked()) {
         ev.preventDefault();
         return;
       }
@@ -868,7 +1001,7 @@ downloadBtn.addEventListener("click", async () => {
     URL.revokeObjectURL(url);
   } catch (e) {
     if (token !== exportSeq || epoch !== state.epoch || rev !== state.rev) return; // 已不属于当前下载：不提示
-    alert(e.errors.join("\n"));
+    alert(errorList(e).join("\n"));
   } finally {
     // 只有仍持有收尾权的下载才能清掉等待状态：旧下载提前返回时不得解锁新下载
     if (token === exportSeq) {
